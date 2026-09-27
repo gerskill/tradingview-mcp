@@ -1,0 +1,362 @@
+//@version=6
+// =============================================================================
+// IC Markets Raw — EURUSD H1 Trend-Pullback MTF
+// -----------------------------------------------------------------------------
+// Stratégie de suivi de tendance : on n'achète que les replis (pullbacks) sur
+// l'EMA rapide dans une tendance confirmée en H1 ET en H4, pendant les sessions
+// liquides (Londres / New York), avec un risque fixe en % du capital.
+//
+// Conçue pour un compte IC Markets Raw Spread :
+//   - commission 3,50 $ par lot standard (100 000 unités) et par côté
+//     => 7 $ aller-retour, modélisée en cash_per_contract = 0.000035 / unité
+//   - spread Raw (~0,0–0,2 pip) + slippage modélisés via `slippage` (pipettes)
+//
+// Non-repaint :
+//   - tous les signaux sont évalués sur bougie clôturée (barstate.isconfirmed)
+//   - la tendance H4 n'utilise que la dernière bougie H4 CLÔTURÉE
+//     (expression[1] + lookahead_on = pattern officiel non-repaint)
+//
+// Un backtest est une simulation historique, pas une garantie de résultats.
+// =============================================================================
+
+// =============================================================================
+// 1. CONFIGURATION
+// =============================================================================
+strategy(title                   = "IC Markets Raw — Trend Pullback MTF",
+         shorttitle              = "ICM TrendPB",
+         overlay                 = true,
+         initial_capital         = 10000,
+         currency                = currency.USD,
+         default_qty_type        = strategy.fixed,
+         default_qty_value       = 1000,
+         pyramiding              = 0,
+         commission_type         = strategy.commission.cash_per_contract,
+         commission_value        = 0.000035,   // 3,50 $ / 100 000 unités / côté (Forex USD)
+         slippage                = 3,          // 3 ticks = 0,3 pip sur EURUSD (spread Raw + slippage)
+         margin_long             = 3.33,       // levier 1:30 (ESMA). 0.2 pour 1:500
+         margin_short            = 3.33,
+         process_orders_on_close = false,      // exécution à l'ouverture de la bougie suivante
+         calc_on_every_tick      = false,
+         max_bars_back           = 500)
+
+// =============================================================================
+// 2. INPUTS UTILISATEUR
+// =============================================================================
+const string G_DIR   = "Direction & période"
+const string G_TREND = "Tendance"
+const string G_ENTRY = "Entrée (pullback)"
+const string G_FILT  = "Filtres"
+const string G_RISK  = "Gestion du risque"
+const string G_EXIT  = "Sorties"
+const string G_PROT  = "Protections du compte"
+const string G_VIS   = "Visualisation"
+
+enableLong    = input.bool(true,  "Activer les Long",  group = G_DIR)
+enableShort   = input.bool(true,  "Activer les Short", group = G_DIR)
+startDate     = input.time(timestamp("01 Jan 2020 00:00 +0000"), "Début du backtest", group = G_DIR)
+endDate       = input.time(timestamp("31 Dec 2099 00:00 +0000"), "Fin du backtest",   group = G_DIR)
+
+htfTf         = input.timeframe("240", "Timeframe de tendance (HTF)", group = G_TREND)
+htfEmaLen     = input.int(200, "EMA HTF",          minval = 10, group = G_TREND)
+emaMidLen     = input.int(50,  "EMA moyenne (TF)", minval = 5,  group = G_TREND)
+emaSlowLen    = input.int(200, "EMA lente (TF)",   minval = 20, group = G_TREND)
+
+emaFastLen    = input.int(21, "EMA de pullback",                     minval = 3, group = G_ENTRY)
+pbLookback    = input.int(5,  "Pullback : touche de l'EMA dans les N dernières bougies", minval = 1, maxval = 20, group = G_ENTRY)
+rsiLen        = input.int(14, "RSI longueur",                        minval = 2, group = G_ENTRY)
+rsiMid        = input.float(50.0, "RSI seuil momentum",              group = G_ENTRY)
+rsiMaxLong    = input.float(70.0, "RSI max pour Long (pas de surachat)", group = G_ENTRY)
+rsiMinShort   = input.float(30.0, "RSI min pour Short (pas de survente)", group = G_ENTRY)
+
+adxLen        = input.int(14, "ADX longueur", minval = 2, group = G_FILT)
+adxMin        = input.float(20.0, "ADX minimum (filtre range)", group = G_FILT)
+useSession    = input.bool(true, "Filtre de session", group = G_FILT)
+sessionStr    = input.session("0700-1700", "Session d'entrée (heure de Londres)", group = G_FILT)
+sessionTz     = input.string("Europe/London", "Fuseau de la session", group = G_FILT)
+cooldownBars  = input.int(3, "Bougies d'attente après une sortie", minval = 0, group = G_FILT)
+
+riskPct       = input.float(0.5, "Risque par trade (% equity)", minval = 0.05, maxval = 5.0, step = 0.05, group = G_RISK)
+atrLen        = input.int(14, "ATR longueur", minval = 2, group = G_RISK)
+slAtrMult     = input.float(1.5, "Stop Loss = ATR ×", minval = 0.3, step = 0.1, group = G_RISK)
+lotStep       = input.int(1000, "Pas de quantité (unités, 1000 = 0,01 lot)", minval = 1, group = G_RISK)
+maxLeverage   = input.float(10.0, "Levier effectif maximum par position", minval = 1.0, group = G_RISK)
+
+tp1R          = input.float(1.0, "TP1 (multiple de R)", minval = 0.2, step = 0.1, group = G_EXIT)
+tp1Pct        = input.int(50, "TP1 : % de la position clôturée", minval = 1, maxval = 99, group = G_EXIT)
+moveToBE      = input.bool(true, "Stop au break-even après TP1", group = G_EXIT)
+beOffsetPips  = input.float(0.2, "Offset break-even (pips, couvre la commission)", minval = 0.0, step = 0.1, group = G_EXIT)
+useTp2        = input.bool(true, "TP2 fixe", group = G_EXIT)
+tp2R          = input.float(2.5, "TP2 (multiple de R)", minval = 0.5, step = 0.1, group = G_EXIT)
+useTrail      = input.bool(true, "Trailing stop ATR après TP1", group = G_EXIT)
+trailAtrMult  = input.float(2.0, "Trailing = ATR ×", minval = 0.5, step = 0.1, group = G_EXIT)
+exitOnOpposite = input.bool(true, "Sortie sur perte de tendance H1 (EMA 50/200)", group = G_EXIT)
+fridayClose   = input.bool(true, "Fermeture forcée le vendredi", group = G_EXIT)
+fridayHour    = input.int(20, "Heure de fermeture vendredi (fuseau session)", minval = 0, maxval = 23, group = G_EXIT)
+
+maxDailyLossPct = input.float(2.0, "Perte journalière max (% equity début de journée)", minval = 0.1, step = 0.1, group = G_PROT)
+maxTradesDay    = input.int(3, "Trades max par jour", minval = 1, group = G_PROT)
+maxLossStreak   = input.int(4, "Pertes consécutives avant pause", minval = 1, group = G_PROT)
+pauseBars       = input.int(24, "Durée de la pause (bougies)", minval = 0, group = G_PROT)
+
+showEmas      = input.bool(true, "Afficher les EMA", group = G_VIS)
+showLevels    = input.bool(true, "Afficher SL / TP", group = G_VIS)
+showSessionBg = input.bool(false, "Colorer la session", group = G_VIS)
+showTable     = input.bool(true, "Tableau de statistiques", group = G_VIS)
+
+// =============================================================================
+// 3. CALCUL DES INDICATEURS
+// =============================================================================
+emaFast = ta.ema(close, emaFastLen)
+emaMid  = ta.ema(close, emaMidLen)
+emaSlow = ta.ema(close, emaSlowLen)
+rsi     = ta.rsi(close, rsiLen)
+atr     = ta.atr(atrLen)
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+
+pip = syminfo.mintick * 10   // 5 décimales sur EURUSD chez IC Markets => 1 pip = 10 ticks
+
+// =============================================================================
+// 4. CALCUL MTF (non-repaint)
+// =============================================================================
+// [1] + lookahead_on : on lit la dernière bougie HTF clôturée, identique en
+// historique et en temps réel. Aucune donnée future.
+htfEma   = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfEmaLen)[1], lookahead = barmerge.lookahead_on)
+htfClose = request.security(syminfo.tickerid, htfTf, close[1],                     lookahead = barmerge.lookahead_on)
+
+htfValid = timeframe.in_seconds(htfTf) >= timeframe.in_seconds(timeframe.period)
+if barstate.isfirst and not htfValid
+    runtime.error("Le timeframe HTF doit être supérieur ou égal au timeframe du graphique.")
+
+// =============================================================================
+// 5. DÉTECTION DE TENDANCE
+// =============================================================================
+htfBull = not na(htfEma) and htfClose > htfEma
+htfBear = not na(htfEma) and htfClose < htfEma
+tfBull  = emaMid > emaSlow and close > emaSlow
+tfBear  = emaMid < emaSlow and close < emaSlow
+trending = adx >= adxMin
+
+// =============================================================================
+// 6-7. CONDITIONS LONG / SHORT
+// =============================================================================
+inDateRange = time >= startDate and time <= endDate
+inSession   = not useSession or not na(time(timeframe.period, sessionStr, sessionTz))
+
+// Pullback : le prix est revenu toucher l'EMA rapide récemment...
+touchedLong  = ta.lowest(low,  pbLookback) <= emaFast
+touchedShort = ta.highest(high, pbLookback) >= emaFast
+// ...puis reprise : clôture du bon côté de l'EMA et cassure de la bougie précédente
+triggerLong  = close > emaFast and close > high[1] and close > open
+triggerShort = close < emaFast and close < low[1]  and close < open
+
+momentumLong  = rsi > rsiMid and rsi < rsiMaxLong
+momentumShort = rsi < rsiMid and rsi > rsiMinShort
+
+// HTF + TF + ADX + Pullback + Trigger + RSI  →  signal
+rawLong  = htfBull and tfBull and trending and touchedLong  and triggerLong  and momentumLong
+rawShort = htfBear and tfBear and trending and touchedShort and triggerShort and momentumShort
+
+// =============================================================================
+// 8. GESTION DU RISQUE
+// =============================================================================
+// --- Suivi journalier (equity de début de journée, nb de trades)
+var float dayStartEquity = strategy.initial_capital
+var int   tradesToday    = 0
+if timeframe.change("D")
+    dayStartEquity := strategy.equity
+    tradesToday    := 0
+
+dayPnl        = strategy.equity - dayStartEquity
+dailyLossHit  = dayPnl <= -dayStartEquity * maxDailyLossPct / 100
+tradesLimitOk = tradesToday < maxTradesDay
+
+// --- Série de pertes (une position = somme de ses sorties partielles)
+var float netAtLastFlat  = 0.0
+var int   lossStreak     = 0
+var int   pauseUntilBar  = -1
+var int   lastExitBar    = -1000
+if strategy.closedtrades > strategy.closedtrades[1] and strategy.position_size == 0
+    positionPnl = strategy.netprofit - netAtLastFlat
+    netAtLastFlat := strategy.netprofit
+    lastExitBar   := bar_index
+    lossStreak    := positionPnl < 0 ? lossStreak + 1 : 0
+    if lossStreak >= maxLossStreak
+        pauseUntilBar := bar_index + pauseBars
+        lossStreak    := 0
+
+paused     = bar_index <= pauseUntilBar
+cooldownOk = bar_index - lastExitBar > cooldownBars
+
+// --- Taille de position : risque fixe en % de l'equity
+fxRate    = request.currency_rate(syminfo.currency, strategy.account_currency, ignore_invalid_currency = true)
+unitValue = syminfo.pointvalue * nz(fxRate, 1.0)          // valeur d'1 unité pour 1.0 de variation de prix
+slDist    = atr * slAtrMult
+riskCash  = strategy.equity * riskPct / 100
+
+f_qty(float dist) =>
+    float rawQty = dist > 0 ? riskCash / (dist * unitValue) : 0.0
+    float maxQty = strategy.equity * maxLeverage / (close * unitValue)
+    float q      = math.min(rawQty, maxQty)
+    math.floor(q / lotStep) * lotStep
+
+qty = f_qty(slDist)
+
+isFlat   = strategy.position_size == 0
+canTrade = barstate.isconfirmed and inDateRange and inSession and isFlat and not dailyLossHit and tradesLimitOk and not paused and cooldownOk and qty >= lotStep and not na(atr)
+
+dayOfWeekTz = dayofweek(time, sessionTz)
+hourTz      = hour(time, sessionTz)
+lateFriday  = fridayClose and dayOfWeekTz == dayofweek.friday and hourTz >= fridayHour - 1  // pas de nouvelle entrée juste avant la fermeture
+
+longSignal  = enableLong  and canTrade and rawLong  and not lateFriday
+shortSignal = enableShort and canTrade and rawShort and not lateFriday
+
+// =============================================================================
+// 12 (utilitaire). MESSAGES D'ALERTE JSON
+// =============================================================================
+f_num(float v) =>
+    na(v) ? "null" : str.tostring(v, format.mintick)
+
+f_json(string action, float units, float sl, float tp1, float tp2) =>
+    '{"action":"' + action + '","symbol":"' + syminfo.ticker + '","exchange":"' + syminfo.prefix + '"' +
+     ',"units":' + str.tostring(units, "#") + ',"lots":' + str.tostring(units / 100000, "#.##") +
+     ',"price":' + f_num(close) + ',"sl":' + f_num(sl) + ',"tp1":' + f_num(tp1) + ',"tp2":' + f_num(tp2) +
+     ',"strategy":"ICM_TrendPB","time":"{{timenow}}"}'
+
+// =============================================================================
+// 9. ENTRÉES
+// =============================================================================
+var float slPrice   = na
+var float tp1Price  = na
+var float tp2Price  = na
+var float trailStop = na
+var float initQty   = na
+var bool  tp1Done   = false
+
+if longSignal
+    slPrice   := close - slDist
+    tp1Price  := close + slDist * tp1R
+    tp2Price  := useTp2 ? close + slDist * tp2R : na
+    trailStop := na
+    initQty   := qty
+    tp1Done   := false
+    tradesToday += 1
+    strategy.entry("Long", strategy.long, qty = qty, comment = "Long",
+                   alert_message = f_json("buy", qty, slPrice, tp1Price, tp2Price))
+
+if shortSignal
+    slPrice   := close + slDist
+    tp1Price  := close - slDist * tp1R
+    tp2Price  := useTp2 ? close - slDist * tp2R : na
+    trailStop := na
+    initQty   := qty
+    tp1Done   := false
+    tradesToday += 1
+    strategy.entry("Short", strategy.short, qty = qty, comment = "Short",
+                   alert_message = f_json("sell", qty, slPrice, tp1Price, tp2Price))
+
+// =============================================================================
+// 10-11. STOP LOSS / TAKE PROFIT / GESTION DES POSITIONS
+// =============================================================================
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+
+// TP1 exécuté => la position a été réduite
+if (inLong or inShort) and not tp1Done and math.abs(strategy.position_size) < initQty
+    tp1Done := true
+    if moveToBE
+        bePrice = strategy.position_avg_price + (inLong ? 1 : -1) * beOffsetPips * pip
+        slPrice := inLong ? math.max(slPrice, bePrice) : math.min(slPrice, bePrice)
+
+// Trailing ATR (chandelier) après TP1, uniquement sur bougie clôturée
+if tp1Done and useTrail and barstate.isconfirmed
+    if inLong
+        candidate = high - atr * trailAtrMult
+        trailStop := na(trailStop) ? candidate : math.max(trailStop, candidate)
+        slPrice   := math.max(slPrice, trailStop)
+    if inShort
+        candidate = low + atr * trailAtrMult
+        trailStop := na(trailStop) ? candidate : math.min(trailStop, candidate)
+        slPrice   := math.min(slPrice, trailStop)
+
+// Ordres de sortie (ré-émis à chaque bougie pour suivre le stop).
+// Chaque alerte décrit la portion qu'elle ferme réellement (TP1 = partielle, TP2 = reste).
+remainingUnits = tp1Done ? math.abs(strategy.position_size) : initQty * (100 - tp1Pct) / 100
+if inLong or longSignal
+    if not tp1Done
+        strategy.exit("L-TP1", "Long", qty_percent = tp1Pct, stop = slPrice, limit = tp1Price,
+                      comment_profit = "TP1", comment_loss = "SL",
+                      alert_profit = f_json("close_partial_buy", initQty * tp1Pct / 100, slPrice, tp1Price, tp2Price),
+                      alert_loss   = f_json("close_partial_buy", initQty * tp1Pct / 100, slPrice, tp1Price, tp2Price))
+    strategy.exit("L-TP2", "Long", stop = slPrice, limit = tp2Price,
+                  comment_profit = "TP2", comment_loss = tp1Done ? "BE/Trail" : "SL",
+                  alert_message = f_json("close_buy", remainingUnits, slPrice, tp1Price, tp2Price))
+
+if inShort or shortSignal
+    if not tp1Done
+        strategy.exit("S-TP1", "Short", qty_percent = tp1Pct, stop = slPrice, limit = tp1Price,
+                      comment_profit = "TP1", comment_loss = "SL",
+                      alert_profit = f_json("close_partial_sell", initQty * tp1Pct / 100, slPrice, tp1Price, tp2Price),
+                      alert_loss   = f_json("close_partial_sell", initQty * tp1Pct / 100, slPrice, tp1Price, tp2Price))
+    strategy.exit("S-TP2", "Short", stop = slPrice, limit = tp2Price,
+                  comment_profit = "TP2", comment_loss = tp1Done ? "BE/Trail" : "SL",
+                  alert_message = f_json("close_sell", remainingUnits, slPrice, tp1Price, tp2Price))
+
+// Sortie sur perte de tendance H1 (bougie clôturée)
+if exitOnOpposite and barstate.isconfirmed
+    if inLong and emaMid < emaSlow
+        strategy.close("Long", comment = "Tendance perdue", alert_message = f_json("close_buy", strategy.position_size, na, na, na))
+    if inShort and emaMid > emaSlow
+        strategy.close("Short", comment = "Tendance perdue", alert_message = f_json("close_sell", -strategy.position_size, na, na, na))
+
+// Fermeture forcée vendredi (évite le gap du week-end)
+if fridayClose and dayOfWeekTz == dayofweek.friday and hourTz >= fridayHour and not isFlat
+    strategy.close_all(comment = "Vendredi", alert_message = f_json("close_all", math.abs(strategy.position_size), na, na, na))
+
+// Nettoyage des niveaux quand la position est clôturée
+if isFlat and not longSignal and not shortSignal
+    slPrice   := na
+    tp1Price  := na
+    tp2Price  := na
+    trailStop := na
+
+// =============================================================================
+// 13. VISUALISATION
+// =============================================================================
+plot(showEmas ? emaFast : na, "EMA pullback", color = color.new(color.orange, 0),  linewidth = 1)
+plot(showEmas ? emaMid  : na, "EMA moyenne",  color = color.new(color.blue, 0),    linewidth = 1)
+plot(showEmas ? emaSlow : na, "EMA lente",    color = color.new(color.purple, 0),  linewidth = 2)
+plot(showEmas ? htfEma  : na, "EMA HTF",      color = color.new(color.gray, 0),    linewidth = 2, style = plot.style_stepline)
+
+hasPos = not isFlat
+plot(showLevels and hasPos ? slPrice  : na, "Stop",  color = color.red,   style = plot.style_linebr, linewidth = 2)
+plot(showLevels and hasPos and not tp1Done ? tp1Price : na, "TP1", color = color.teal, style = plot.style_linebr)
+plot(showLevels and hasPos ? tp2Price : na, "TP2",   color = color.green, style = plot.style_linebr, linewidth = 2)
+plot(showLevels and hasPos ? strategy.position_avg_price : na, "Entrée", color = color.gray, style = plot.style_linebr)
+
+plotshape(longSignal,  "Signal Long",  shape.triangleup,   location.belowbar, color.green, size = size.small)
+plotshape(shortSignal, "Signal Short", shape.triangledown, location.abovebar, color.red,   size = size.small)
+
+bgcolor(showSessionBg and useSession and inSession ? color.new(color.blue, 93) : na, title = "Session")
+
+// =============================================================================
+// 14. DEBUG / STATISTIQUES
+// =============================================================================
+var table stats = table.new(position.top_right, 2, 7, bgcolor = color.new(color.black, 20), border_width = 1)
+
+f_row(int r, string k, string v, color c) =>
+    table.cell(stats, 0, r, k, text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(stats, 1, r, v, text_color = c,           text_size = size.small, text_halign = text.align_right)
+
+if showTable and barstate.islast
+    closed  = strategy.closedtrades
+    winRate = closed > 0 ? strategy.wintrades * 100.0 / closed : 0.0
+    pf      = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    ddPct   = strategy.max_drawdown / strategy.initial_capital * 100
+    f_row(0, "Sorties (partielles incl.)", str.tostring(closed), color.white)
+    f_row(1, "Win rate",        str.tostring(winRate, "#.#") + " %", color.white)
+    f_row(2, "Profit factor",   na(pf) ? "—" : str.tostring(pf, "#.##"), na(pf) or pf < 1 ? color.red : color.lime)
+    f_row(3, "Net profit",      str.tostring(strategy.netprofit, "#.##") + " " + strategy.account_currency, strategy.netprofit >= 0 ? color.lime : color.red)
+    f_row(4, "Max drawdown",    str.tostring(ddPct, "#.##") + " %", color.orange)
+    f_row(5, "PnL du jour",     str.tostring(dayPnl, "#.##"), dayPnl >= 0 ? color.lime : color.red)
+    f_row(6, "État",            paused ? "PAUSE (série de pertes)" : dailyLossHit ? "STOP JOUR" : "Actif", paused or dailyLossHit ? color.orange : color.lime)
